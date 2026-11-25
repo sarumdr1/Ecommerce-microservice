@@ -1,0 +1,200 @@
+# =============================================================================
+# E-Commerce Platform — Docker Compose
+# =============================================================================
+# Profiles:
+#   (none)        — always starts: postgres, redis
+#   core          — gateway (Traefik) + identity provider (Keycloak)
+#   checkout      — Order, Inventory, Payment, RabbitMQ  [Phase 3]
+#   async         — Notification, Mailpit                [Phase 4]
+#   agent         — Agent service, MCP server            [Phase 2]
+#   observability — OTel Collector, Jaeger, Prometheus, Grafana [Phase 5]
+#
+# Usage:
+#   make up                       # start core profile (+ base services)
+#   make up PROFILES=core         # same
+#   docker compose --profile core --profile checkout up -d
+#
+# See Makefile for all targets and docs/PRD.md Section 5.1 for details.
+# =============================================================================
+
+services:
+
+  # ============================================================================
+  # BASE INFRASTRUCTURE — no profile, always starts
+  # ============================================================================
+
+  postgres:
+    image: pgvector/pgvector:pg16   # pgvector pre-installed (needed by agent_db in Phase 2)
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      # Per-service passwords read by the init script
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD}
+      CATALOG_DB_PASSWORD: ${CATALOG_DB_PASSWORD}
+      CART_DB_PASSWORD: ${CART_DB_PASSWORD}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD}
+      INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD}
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/compose/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5433:5432"   # host 5433 → container 5432 (avoids clash with a local Postgres on 5432)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6380:6379"   # host 6380 → container 6379 (avoids clash with a local Redis on 6379)
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ============================================================================
+  # CORE PROFILE — gateway + identity provider
+  # ============================================================================
+
+  traefik:
+    image: traefik:v3.1
+    profiles: [core]
+    restart: unless-stopped
+    command:
+      # API & dashboard (insecure = no auth; fine for local dev only)
+      - --api.dashboard=true
+      - --api.insecure=true
+      # Ping endpoint for health checks
+      - --ping=true
+      # Docker provider — discovers services by their labels
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=ecommerce-network
+      # Entrypoints
+      - --entrypoints.web.address=:80
+      # Access log for debugging routing issues
+      - --accesslog=true
+      - --log.level=INFO
+    ports:
+      - "8000:80"     # HTTP — application traffic  (host:container; avoids clash with system port 80)
+      - "8888:8080"   # Traefik dashboard — http://localhost:8888/dashboard/
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # read-only; Traefik needs this to watch containers
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/ping"]   # internal container port, not host port
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    profiles: [core]
+    restart: unless-stopped
+    # start-dev: http mode, no TLS cert needed, hot-reload for realm changes
+    # --import-realm: imports any *.json files from /opt/keycloak/data/import on startup
+    command: start-dev --import-realm
+    environment:
+      # Admin console credentials
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      # Postgres backing store (same container as the services)
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak_db
+      KC_DB_USERNAME: keycloak_user
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+      # Allow plain HTTP in dev; services validate JWTs via JWKS, not via KC directly
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./infra/compose/keycloak/realm:/opt/keycloak/data/import:ro
+    ports:
+      - "8081:8080"   # Keycloak UI — http://localhost:8081  (admin / KEYCLOAK_ADMIN_PASSWORD)
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # KC exposes /health/ready when KC_HEALTH_ENABLED=true
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health/ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q 'UP' <&3"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s   # Keycloak JVM takes ~60-90 s to start
+
+  # ============================================================================
+  # CHECKOUT PROFILE — Phase 3
+  # ============================================================================
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    profiles: [checkout]
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbitmq
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-changeme_rabbitmq}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI — http://localhost:15672
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ============================================================================
+  # ASYNC PROFILE — Phase 4
+  # ============================================================================
+
+  mailpit:
+    image: axllent/mailpit:latest
+    profiles: [async]
+    restart: unless-stopped
+    ports:
+      - "1025:1025"    # SMTP — Notification service sends here
+      - "8025:8025"    # Web UI — http://localhost:8025
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8025"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ============================================================================
+  # OBSERVABILITY PROFILE — Phase 5
+  # (placeholder — full config added in Phase 5)
+  # ============================================================================
+
+  # otel-collector, jaeger, prometheus, grafana — added in Phase 5
+
+# =============================================================================
+# Named volumes — `make reset` removes these; `make down` keeps them
+# =============================================================================
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+
+# =============================================================================
+# Network — all services share one bridge network
+# =============================================================================
+networks:
+  default:
+    name: ecommerce-network
