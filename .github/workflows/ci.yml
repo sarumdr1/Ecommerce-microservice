@@ -5,9 +5,9 @@ name: CI
 #   pull_request  → all of the above + breaking-change check against main
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
 
 # Cancel an in-progress run when a new commit is pushed to the same PR.
 # Saves CI minutes; the new run supersedes the old one.
@@ -74,7 +74,7 @@ jobs:
         # This fails if any change would break generated code in a downstream
         # consumer: removed field, changed type, removed RPC, changed package name.
         # PRD: "breaking-change checks in CI" (Section 6.1)
-        run: buf breaking --against '.git#branch=main'
+        run: buf breaking --against '.git#branch=master'
         working-directory: proto
 
   # ─────────────────────────────────────────────────────────────────────────────
