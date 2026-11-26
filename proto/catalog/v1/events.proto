@@ -1,0 +1,43 @@
+// catalog/v1/events.proto — events published by the Catalog service
+//
+// These messages are the PAYLOAD packed inside common.v1.EventEnvelope.payload.
+// They are published to RabbitMQ (locally) / EventBridge (AWS) via the outbox.
+//
+// Consumers:
+//   Inventory service → updates the stock_badge projection when a price changes
+//   Agent service     → refreshes semantic search embeddings (AG-05, Phase 4)
+//
+// PRD ref: Section 4 "publishes PriceChanged", Section 6.1 contract discipline
+
+syntax = "proto3";
+
+package catalog.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "ecommerce/gen/go/catalog/v1;catalogv1";
+
+// PriceChangedEvent is published whenever an admin changes a SKU's price.
+// event_type in the envelope: "catalog.v1.PriceChanged"
+// schema_version: "v1"
+//
+// Why publish this?
+//   Cart items show a price snapshot at add-to-cart time (advisory).
+//   Order takes the authoritative price via BatchGetSkus at checkout.
+//   Downstream services that cache prices need to know to invalidate.
+message PriceChangedEvent {
+  // The SKU whose price changed.
+  string sku_id = 1;
+
+  // Price before the change (minor units).
+  int64 old_price_minor_units = 2;
+
+  // Price after the change (minor units).
+  int64 new_price_minor_units = 3;
+
+  // ISO 4217 currency code (unchanged by a price edit, included for context).
+  string currency_code = 4;
+
+  // Wall-clock time the change was committed.
+  google.protobuf.Timestamp changed_at = 5;
+}

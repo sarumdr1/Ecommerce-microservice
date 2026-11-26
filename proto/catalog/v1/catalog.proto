@@ -1,0 +1,187 @@
+// catalog/v1/catalog.proto — Catalog service contract
+//
+// The Catalog service owns product listings, pricing, images, and the advisory
+// stock badge.  It is the source of truth for SKU data across the whole system.
+//
+// Who calls it (Section 4.1 Synchronous Communication Matrix):
+//   Web BFF      → ListSkus, GetSku, CreateSku, UpdateSku, GetUploadUrl
+//   Cart         → BatchGetSkus (cached, to validate SKUs and show prices)
+//   Order        → BatchGetSkus (cached, to take the authoritative price snapshot)
+//   MCP server   → ListSkus, GetSku (agent tools — read-only)
+//
+// PRD refs: FR-02, FR-12, Section 4 service table row #2
+
+syntax = "proto3";
+
+package catalog.v1;
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "ecommerce/gen/go/catalog/v1;catalogv1";
+
+// ── Enums ────────────────────────────────────────────────────────────────────
+
+// StockBadge is an advisory indicator projected from Inventory.
+// It is NEVER used by checkout to gate a purchase — only for display.
+// PRD: FR-12 "Advisory in stock / low / sold out from an Inventory-fed projection;
+//             never used by checkout"
+enum StockBadge {
+  STOCK_BADGE_UNSPECIFIED = 0;  // default / unknown — treat as IN_STOCK in UI
+  STOCK_BADGE_IN_STOCK    = 1;
+  STOCK_BADGE_LOW         = 2;  // threshold defined by Inventory service config
+  STOCK_BADGE_SOLD_OUT    = 3;
+}
+
+// ── Core resource ─────────────────────────────────────────────────────────────
+
+// Sku (Stock Keeping Unit) is a single purchasable product.
+message Sku {
+  // Stable, opaque identifier (UUID v4). Never reuse a deleted SKU's ID.
+  string id = 1;
+
+  // Display name shown to shoppers.
+  string name = 2;
+
+  // Long-form product description; may contain markdown.
+  string description = 3;
+
+  // Price in the smallest currency unit to avoid floating-point errors.
+  // Examples: 4999 = $49.99 USD,  1000 = ¥1000 JPY
+  // PRD: "single currency, integer minor units" (Section 2.2 Out of Scope)
+  int64 price_minor_units = 4;
+
+  // ISO 4217 currency code, e.g. "USD", "EUR".
+  // Single currency for now; multi-currency is out of scope (Section 2.2).
+  string currency_code = 5;
+
+  // Public URLs of product images (served from MinIO/S3 via presigned GET).
+  // Order matches display order in the UI.
+  repeated string image_urls = 6;
+
+  // Advisory stock indicator projected from the Inventory service.
+  // Updated asynchronously — may lag real stock by up to 10 s (FR-12).
+  StockBadge stock_badge = 7;
+
+  // Flexible key/value attributes for product variants.
+  // Examples: {"size": "42", "color": "black", "material": "leather"}
+  map<string, string> attributes = 8;
+
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+// ── Browse RPCs ───────────────────────────────────────────────────────────────
+
+message ListSkusRequest {
+  // Optional keyword query; empty = return all SKUs.
+  string query = 1;
+
+  // Number of SKUs to return per page. Server caps this at a maximum (e.g. 50).
+  // If 0 the server uses a default page size.
+  int32 page_size = 2;
+
+  // Opaque cursor returned by a previous ListSkusResponse.next_page_token.
+  // Empty = start from the first page.
+  string page_token = 3;
+}
+
+message ListSkusResponse {
+  repeated Sku skus = 1;
+
+  // Opaque cursor for the next page. Empty string = this is the last page.
+  string next_page_token = 2;
+
+  // Approximate total number of matching SKUs (useful for pagination UI).
+  // May not be exact if the catalog is being modified concurrently.
+  int32 total_count = 3;
+}
+
+message GetSkuRequest {
+  string sku_id = 1;
+}
+
+// BatchGetSkus is the hot read path — results are cached in Redis.
+// Called by Cart (100 ms deadline) and Order (150 ms deadline).
+// Returns only the SKUs that exist; missing IDs are silently omitted.
+// Callers must check that all requested IDs are present in the response.
+message BatchGetSkusRequest {
+  // Up to 100 SKU IDs per request; server rejects larger batches.
+  repeated string sku_ids = 1;
+}
+
+message BatchGetSkusResponse {
+  // Map of sku_id → Sku. Missing key = that SKU does not exist.
+  map<string, Sku> skus = 1;
+}
+
+// ── Admin RPCs ────────────────────────────────────────────────────────────────
+
+message CreateSkuRequest {
+  string name            = 1;
+  string description     = 2;
+  int64  price_minor_units = 3;
+  string currency_code   = 4;
+  map<string, string> attributes = 5;
+}
+
+// UpdateSku uses a FieldMask so callers declare exactly which fields they intend
+// to change.  Fields absent from update_mask are left untouched.
+// Example: to update only the price, set update_mask.paths = ["price_minor_units"]
+message UpdateSkuRequest {
+  string sku_id          = 1;
+  string name            = 2;
+  string description     = 3;
+  int64  price_minor_units = 4;
+  map<string, string> attributes = 5;
+
+  // Which fields in this message to apply. Required.
+  google.protobuf.FieldMask update_mask = 6;
+}
+
+message DeleteSkuRequest {
+  string sku_id = 1;
+}
+
+// GetUploadUrl returns a short-lived presigned PUT URL for direct browser-to-S3
+// (or MinIO) upload.  The app server never proxies image bytes.
+// PRD: FR-02 "presigned MinIO/S3 PUT (5-min expiry, type and size constrained)"
+message GetUploadUrlRequest {
+  string sku_id = 1;
+
+  // MIME type the client will PUT, e.g. "image/jpeg", "image/webp".
+  // Server rejects types outside its allowlist.
+  string content_type = 2;
+
+  // File size in bytes. Server rejects files over its configured maximum.
+  int64 size_bytes = 3;
+}
+
+message GetUploadUrlResponse {
+  // Presigned PUT URL — valid for 5 minutes (FR-02).
+  // Client performs: PUT upload_url  Content-Type: <content_type>  Body: <file>
+  string upload_url = 1;
+
+  // The public URL the image will be accessible at after upload completes.
+  // Store this in the SKU's image_urls by calling UpdateSku after upload.
+  string image_url = 2;
+
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+// ── Service definition ────────────────────────────────────────────────────────
+
+service CatalogService {
+  // Public — no auth required
+  rpc ListSkus(ListSkusRequest)   returns (ListSkusResponse);
+  rpc GetSku(GetSkuRequest)       returns (Sku);
+
+  // Cached — called by Cart and Order services (Section 4.1)
+  rpc BatchGetSkus(BatchGetSkusRequest) returns (BatchGetSkusResponse);
+
+  // Admin only — gateway enforces the admin role before forwarding
+  rpc CreateSku(CreateSkuRequest)       returns (Sku);
+  rpc UpdateSku(UpdateSkuRequest)       returns (Sku);
+  rpc DeleteSku(DeleteSkuRequest)       returns (Sku);
+  rpc GetUploadUrl(GetUploadUrlRequest) returns (GetUploadUrlResponse);
+}

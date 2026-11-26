@@ -1,0 +1,155 @@
+// cart/v1/cart.proto — Cart service contract
+//
+// The Cart service manages shopping carts for both anonymous guests and
+// authenticated users.  It is a pure read/write store — it validates SKU IDs
+// by calling Catalog.BatchGetSkus but it never calls Payment or Inventory.
+//
+// Anonymous carts:
+//   - Created when a guest adds their first item.
+//   - Identified by a signed token the browser stores (not a session cookie).
+//   - Merged into the user's cart on sign-in via MergeCarts.
+//
+// Who calls it (Section 4.1):
+//   Web BFF      → AddItem, UpdateItem, RemoveItem, GetCart, MergeCarts
+//   Order        → GetCheckoutSnapshot (read the cart lines at checkout time)
+//   MCP server   → GetCart, AddItem (agent shopping assistant — after shopper confirms)
+//
+// PRD refs: FR-03, Section 4 service table row #3
+
+syntax = "proto3";
+
+package cart.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "ecommerce/gen/go/cart/v1;cartv1";
+
+// ── Core resources ────────────────────────────────────────────────────────────
+
+// CartItem represents one line in the cart.
+message CartItem {
+  // The SKU being purchased.
+  string sku_id = 1;
+
+  // How many units. Always ≥ 1; server enforces per-SKU caps.
+  // PRD: "merge sums quantities and caps at per-SKU limits" (J1 edge case)
+  int32 quantity = 2;
+
+  // Price captured from Catalog at the time this item was added.
+  // This is ADVISORY — it is shown in the cart UI but not used for billing.
+  // Order service takes the authoritative price from Catalog at checkout.
+  // PRD: "Price changed since add-to-cart: order uses the authoritative price snapshot" (J2)
+  int64 price_minor_units_snapshot = 3;
+
+  // Product name captured at add-to-cart time.
+  // Shown in the cart even if the name is later changed in Catalog.
+  string name_snapshot = 4;
+}
+
+// Cart is the full shopping cart for one shopper.
+message Cart {
+  // Opaque cart ID (UUID v4).
+  // For authenticated users this is stable across sessions.
+  // For guests this is derived from the signed anonymous cart token.
+  string cart_id = 1;
+
+  // User ID from Keycloak (sub claim). Empty for anonymous carts.
+  string user_id = 2;
+
+  repeated CartItem items = 3;
+
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+
+  // For anonymous carts: the time after which this cart is eligible for GC.
+  // Null for authenticated carts (they persist until checkout or explicit delete).
+  google.protobuf.Timestamp expires_at = 6;
+}
+
+// ── Mutation RPCs ─────────────────────────────────────────────────────────────
+
+// AddItem adds a SKU to the cart, or increments its quantity if already present.
+// Cart service calls Catalog.BatchGetSkus to validate sku_id before adding.
+// Returns NOT_FOUND if sku_id does not exist.
+// Returns RESOURCE_EXHAUSTED if the resulting quantity would exceed the per-SKU cap.
+message AddItemRequest {
+  string cart_id = 1;
+  string sku_id  = 2;
+
+  // Units to add. Must be ≥ 1.
+  int32  quantity = 3;
+}
+
+// UpdateItem sets the quantity for a SKU already in the cart.
+// Setting quantity to 0 is equivalent to RemoveItem.
+message UpdateItemRequest {
+  string cart_id  = 1;
+  string sku_id   = 2;
+
+  // New absolute quantity (not a delta). Set to 0 to remove the item.
+  int32  quantity = 3;
+}
+
+message RemoveItemRequest {
+  string cart_id = 1;
+  string sku_id  = 2;
+}
+
+// ── Read RPCs ────────────────────────────────────────────────────────────────
+
+message GetCartRequest {
+  string cart_id = 1;
+}
+
+// MergeCarts is called by Identity service immediately after a user signs in.
+// All items from the anonymous cart are merged into the user's cart.
+// If the same SKU exists in both, quantities are summed (and capped).
+// After merging, the anonymous cart is deleted.
+// PRD: FR-03 "anonymous cart via signed token, merged at sign-in"
+message MergeCartsRequest {
+  // The temporary cart the guest was using before login.
+  string anonymous_cart_id = 1;
+
+  // The authenticated user's cart. May be empty if the user had no cart.
+  string user_cart_id = 2;
+}
+
+// GetCheckoutSnapshot is called ONLY by the Order service at checkout time.
+// It returns a point-in-time snapshot of the cart lines to include in the order.
+// The snapshot is taken inside a transaction; the cart is NOT cleared here —
+// Order clears or archives the cart after CONFIRMED.
+// Deadline: 100 ms (Section 4.1)
+message GetCheckoutSnapshotRequest {
+  string cart_id = 1;
+}
+
+// CheckoutSnapshot is the immutable view of cart lines recorded in the Order.
+// It is NOT a Cart — it has no user_id or expiry, just the items and a timestamp.
+message CheckoutSnapshot {
+  string cart_id = 1;
+
+  // Line items as they were at snapshot time.
+  // Prices here are advisory snapshots — Order re-fetches from Catalog for billing.
+  repeated CartItem items = 2;
+
+  // Exact time the snapshot was taken (used for auditing).
+  google.protobuf.Timestamp snapshot_at = 3;
+}
+
+// ── Service definition ────────────────────────────────────────────────────────
+
+service CartService {
+  // Mutations — authenticated user or valid anonymous cart token required
+  rpc AddItem(AddItemRequest)       returns (Cart);
+  rpc UpdateItem(UpdateItemRequest) returns (Cart);
+  rpc RemoveItem(RemoveItemRequest) returns (Cart);
+
+  // Reads
+  rpc GetCart(GetCartRequest) returns (Cart);
+
+  // Called by Identity after sign-in
+  rpc MergeCarts(MergeCartsRequest) returns (Cart);
+
+  // Called by Order service only — not exposed through the BFF
+  rpc GetCheckoutSnapshot(GetCheckoutSnapshotRequest) returns (CheckoutSnapshot);
+}

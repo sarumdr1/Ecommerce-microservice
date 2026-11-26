@@ -65,6 +65,42 @@ psql:                  ## Open a psql shell as the postgres superuser
 	@echo "Connecting to postgres as superuser. Use \\c <dbname> to switch databases."
 	docker compose exec postgres psql -U postgres
 
+# ── Proto / Buf ───────────────────────────────────────────────────────────────
+
+.PHONY: proto-install
+proto-install:         ## Install Buf CLI into ~/.local/bin (no sudo needed)
+	@mkdir -p ~/.local/bin
+	@echo "Installing Buf CLI..."
+	curl -sSL https://github.com/bufbuild/buf/releases/latest/download/buf-Linux-x86_64 \
+		-o ~/.local/bin/buf
+	chmod +x ~/.local/bin/buf
+	@echo "✓ buf installed to ~/.local/bin/buf"
+	@echo ""
+	@echo "If 'buf' is not found after this, add ~/.local/bin to your PATH:"
+	@echo "  echo 'export PATH=\"\$$HOME/.local/bin:\$$PATH\"' >> ~/.bashrc && source ~/.bashrc"
+	@echo ""
+	~/.local/bin/buf --version
+
+.PHONY: proto-deps
+proto-deps:            ## Download and lock Buf dependencies (run after editing buf.yaml)
+	cd proto && buf dep update
+
+.PHONY: proto-lint
+proto-lint:            ## Lint all .proto files
+	cd proto && buf lint
+
+.PHONY: proto-breaking
+proto-breaking:        ## Check for breaking changes against main branch
+	cd proto && buf breaking --against '.git#branch=main'
+
+.PHONY: proto-gen
+proto-gen:             ## Generate Go + TypeScript stubs into gen/
+	cd proto && buf generate
+	@echo "✓ Stubs written to gen/go and gen/ts"
+
+.PHONY: proto-check
+proto-check: proto-lint proto-breaking  ## Lint + breaking check (run in CI)
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 .PHONY: check-env

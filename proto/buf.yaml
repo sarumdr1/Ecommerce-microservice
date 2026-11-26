@@ -1,0 +1,37 @@
+# buf.yaml — Buf module configuration
+# Docs: https://buf.build/docs/configuration/v2/buf-yaml
+version: v2
+
+modules:
+  - path: .
+
+# External dependencies — googleapis provides google/rpc/status.proto and
+# google/rpc/error_details.proto.  Well-known types (google/protobuf/*.proto)
+# are built into Buf and do not need to be listed here.
+deps:
+  - buf.build/googleapis/googleapis
+
+lint:
+  # STANDARD is the current name for the default curated rule set (DEFAULT is deprecated).
+  use:
+    - STANDARD
+  except:
+    # RPC_RESPONSE_STANDARD_NAME requires every RPC response to be named
+    # <RpcName>Response (e.g. GetSkuResponse wrapping a Sku field).
+    # We instead return the resource directly (GetSku → Sku, CreateSku → Sku)
+    # following the resource-oriented style from Google AIP-131/133.
+    # Tradeoff: slightly less extensible (can't add response-level metadata later
+    # without a breaking change), but simpler and more readable for a learning project.
+    - RPC_RESPONSE_STANDARD_NAME
+    # RPC_REQUEST_RESPONSE_UNIQUE requires each RPC to have its own unique request
+    # and response message types. We share Cart across AddItem/UpdateItem/RemoveItem/
+    # GetCart/MergeCarts because they all return the same full cart state — no
+    # wrapper needed. Same for Sku across GetSku/CreateSku/UpdateSku/DeleteSku.
+    - RPC_REQUEST_RESPONSE_UNIQUE
+
+breaking:
+  # FILE level = any change that would break generated code in a downstream
+  # consumer (removed field, changed type, removed RPC) fails the check.
+  # This runs in CI on every PR via: buf breaking --against .git#branch=main
+  use:
+    - FILE

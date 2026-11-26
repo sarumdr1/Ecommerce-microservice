@@ -1,0 +1,39 @@
+# buf.gen.yaml — Code generation configuration
+# Run: buf generate   (from inside /proto)
+# Output lands in /gen/go and /gen/ts (both gitignored — always regenerate, never edit)
+version: v2
+
+inputs:
+  - directory: .
+
+plugins:
+  # ── Go: message structs ─────────────────────────────────────────────────────
+  # protoc-gen-go generates a .pb.go file for every .proto file.
+  # paths=source_relative: output mirrors the input directory tree.
+  - remote: buf.build/protocolbuffers/go
+    out: ../gen/go
+    opt:
+      - paths=source_relative
+
+  # ── Go: gRPC server/client stubs ────────────────────────────────────────────
+  # protoc-gen-go-grpc generates a _grpc.pb.go file for every service.
+  # require_unimplemented_servers=false: lets us add RPCs incrementally without
+  # breaking existing server implementations.
+  - remote: buf.build/grpc/go
+    out: ../gen/go
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=false
+
+  # ── TypeScript stubs — enable in Phase 1 when the BFF is scaffolded ──────────
+  # Install first: npm install -g ts-proto
+  # Then uncomment this block and re-run: make proto-gen
+  #
+  # - local: protoc-gen-ts_proto
+  #   out: ../gen/ts
+  #   opt:
+  #     - outputServices=grpc-js
+  #     - esModuleInterop=true
+  #     - stringEnums=true
+  #     - useDate=string
+  #     - paths=source_relative

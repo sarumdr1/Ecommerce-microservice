@@ -1,0 +1,279 @@
+name: CI
+
+# Triggers:
+#   push to main  → contract checks + security scans (gates the branch)
+#   pull_request  → all of the above + breaking-change check against main
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-progress run when a new commit is pushed to the same PR.
+# Saves CI minutes; the new run supersedes the old one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HOW TO ADD A SERVICE JOB
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. Copy the commented template at the bottom of this file.
+# 2. Rename it to your service (e.g. "catalog").
+# 3. Set the correct working-directory and language setup action.
+# 4. Add it to the needs: list of the ci-ok job at the bottom.
+# 5. Commit proto stubs (or run buf generate) before the service job runs.
+#
+# Phase reference:
+#   Phase 1 → catalog, cart, identity, bff
+#   Phase 2 → agent
+#   Phase 3 → order, inventory, payment
+#   Phase 4 → notification
+#   Phase 5 → load-test, chaos (separate workflow)
+#   Phase 6 → terraform-plan (separate workflow)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CONTRACT CHECKS
+  # Runs on every push and PR.  Protobuf contracts are the source of truth —
+  # these gates must pass before any service job runs.
+  # PRD: Section 6.1 "Buf lint and breaking-change checks in CI"
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  proto-lint:
+    name: Proto — lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: "1.47.2"   # pin so a Buf release can't silently break CI
+
+      - name: Lint .proto files
+        run: buf lint
+        working-directory: proto
+
+  proto-breaking:
+    name: Proto — breaking changes
+    runs-on: ubuntu-latest
+    # Only meaningful on PRs — on a push to main there is no "before" to compare.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # need full git history so buf can read the main branch tip
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: "1.47.2"
+
+      - name: Check for breaking changes against main
+        # This fails if any change would break generated code in a downstream
+        # consumer: removed field, changed type, removed RPC, changed package name.
+        # PRD: "breaking-change checks in CI" (Section 6.1)
+        run: buf breaking --against '.git#branch=main'
+        working-directory: proto
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SECURITY SCANS
+  # PRD Section 8.2: "SAST, dependency, image and IaC scanning; secret scan"
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  secret-scan:
+    name: Security — secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # scan full history, not just HEAD
+
+      # Gitleaks detects hardcoded secrets (API keys, passwords, tokens) using
+      # ~150 regex rules plus entropy analysis.
+      # Docs: https://github.com/gitleaks/gitleaks-action
+      # Note: free for public repos; a GITLEAKS_LICENSE secret is needed for
+      #       private org repos — see docs above for details.
+      - name: Scan for hardcoded secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Security — dependency & IaC scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Trivy scans:
+      #   - Language dependencies (go.sum, package-lock.json, pom.xml, pyproject.toml)
+      #   - IaC files (Terraform, Dockerfile, docker-compose.yml)
+      #   - Reports CRITICAL and HIGH CVEs
+      # In Phase 6 add image scanning: scan-type: image, image-ref: <ecr-url>
+      - name: Scan dependencies and IaC for CVEs
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-results.sarif
+          # Generate an SBOM alongside the CVE report (PRD Section 8.2)
+          list-all-pkgs: true
+
+      # Upload findings to GitHub Security tab (Dependabot alerts panel).
+      # Requires: public repo OR GitHub Advanced Security licence.
+      # On a private repo without Advanced Security this step is skipped
+      # gracefully — the SARIF file is still saved as an artifact below.
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true   # don't fail the job if the repo is private
+
+      - name: Save SARIF as artifact (always available for download)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif
+          path: trivy-results.sarif
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CI-OK — single status check for branch protection rules
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Set ONE branch protection rule: "require ci-ok to pass".
+  # This job succeeds only when every job it depends on succeeds.
+  # When you add a new service job, add its name to the needs: list here.
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  ci-ok:
+    name: CI passed
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - proto-lint
+      - proto-breaking
+      - secret-scan
+      - dependency-scan
+      # ── service jobs added per phase ──
+      # - catalog       # Phase 1
+      # - cart          # Phase 1
+      # - identity      # Phase 1
+      # - bff           # Phase 1
+      # - agent         # Phase 2
+      # - order         # Phase 3
+      # - inventory     # Phase 3
+      # - payment       # Phase 3
+      # - notification  # Phase 4
+    steps:
+      - name: Check all jobs passed
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          failed = [name for name, r in needs.items()
+                    if r['result'] not in ('success', 'skipped')]
+          if failed:
+              print('FAILED jobs:', ', '.join(failed))
+              sys.exit(1)
+          print('All jobs passed or were skipped.')
+          "
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # SERVICE JOB TEMPLATE — copy, rename, and uncomment when scaffolding a service
+  # ═══════════════════════════════════════════════════════════════════════════════
+  #
+  # catalog:
+  #   name: Catalog service (Go)
+  #   runs-on: ubuntu-latest
+  #   # Only run when catalog source or its proto contract changed.
+  #   # Skips the job entirely on unrelated changes — saves CI minutes.
+  #   paths:
+  #     - 'services/catalog/**'
+  #     - 'proto/catalog/**'
+  #     - 'proto/common/**'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - uses: bufbuild/buf-setup-action@v1
+  #       with:
+  #         version: "1.47.2"
+  #     - name: Generate stubs
+  #       run: buf generate
+  #       working-directory: proto
+  #
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: services/catalog/go.mod
+  #         cache-dependency-path: services/catalog/go.sum
+  #
+  #     - name: Build
+  #       run: go build ./...
+  #       working-directory: services/catalog
+  #
+  #     - name: Test
+  #       run: go test -race -count=1 ./...
+  #       working-directory: services/catalog
+  #       env:
+  #         # Integration tests spin up Postgres via Testcontainers — no mock DB.
+  #         TESTCONTAINERS_RYUK_DISABLED: "true"
+  #
+  #     - name: Lint
+  #       uses: golangci/golangci-lint-action@v6
+  #       with:
+  #         working-directory: services/catalog
+  #
+  # ── Java template (Order, Payment) ───────────────────────────────────────────
+  #
+  # order:
+  #   name: Order service (Java)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-java@v4
+  #       with:
+  #         java-version: '21'
+  #         distribution: 'temurin'
+  #         cache: maven
+  #     - run: mvn -B verify --no-transfer-progress
+  #       working-directory: services/order
+  #
+  # ── TypeScript template (BFF, Notification) ───────────────────────────────────
+  #
+  # bff:
+  #   name: BFF (TypeScript)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-node@v4
+  #       with:
+  #         node-version: '20'
+  #         cache: npm
+  #         cache-dependency-path: services/bff/package-lock.json
+  #     - run: npm ci
+  #       working-directory: services/bff
+  #     - run: npm run lint
+  #       working-directory: services/bff
+  #     - run: npm test
+  #       working-directory: services/bff
+  #
+  # ── Python template (Agent) ───────────────────────────────────────────────────
+  #
+  # agent:
+  #   name: Agent service (Python)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: '3.12'
+  #     - run: pip install uv && uv sync
+  #       working-directory: agent
+  #     - run: uv run mypy .
+  #       working-directory: agent
+  #     - run: uv run pytest
+  #       working-directory: agent

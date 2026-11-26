@@ -1,0 +1,68 @@
+// common/v1/event.proto — event envelope for all async messages
+//
+// Every event published to RabbitMQ (or EventBridge on AWS) is wrapped in this
+// envelope.  Consumers read the envelope to decide whether to process the
+// payload (version check, deduplication) before unmarshalling the inner message.
+//
+// PRD ref: Section 6.1
+//   "envelope with event_id, event_type, schema_version, occurred_at,
+//    producer, aggregate_id, aggregate_version, correlation_id, traceparent"
+
+syntax = "proto3";
+
+package common.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "ecommerce/gen/go/common/v1;commonv1";
+
+message EventEnvelope {
+  // Globally unique ID for this event occurrence (UUID v4).
+  // Consumers deduplicate by storing this in a processed-events table.
+  // PRD: "every consumer deduplicates on event_id"
+  string event_id = 1;
+
+  // Fully-qualified event type in reverse-domain notation.
+  // Examples: "catalog.v1.PriceChanged", "order.v1.OrderConfirmed"
+  // Consumers use this to route to the right handler.
+  string event_type = 2;
+
+  // Schema version of the payload message.
+  // Format: "v1", "v2", etc.
+  // PRD: "additive changes only within a major version;
+  //        order.created.v2 for breaking changes"
+  string schema_version = 3;
+
+  // Wall-clock time the event was produced (UTC).
+  google.protobuf.Timestamp occurred_at = 4;
+
+  // Name of the service that published this event.
+  // Examples: "catalog", "order", "inventory"
+  string producer = 5;
+
+  // ID of the domain object this event is about.
+  // Examples: a sku_id for PriceChanged, an order_id for OrderConfirmed
+  string aggregate_id = 6;
+
+  // Monotonically increasing version of the aggregate when this event was
+  // produced.  Consumers ignore events whose version is older than what they
+  // have already processed.
+  // PRD: "ignores stale aggregate_version"
+  int64 aggregate_version = 7;
+
+  // W3C Trace Context correlation ID — ties this event back to the HTTP
+  // request that caused it.  Copied from the gRPC metadata / HTTP header.
+  string correlation_id = 8;
+
+  // W3C traceparent header value.
+  // Format: "00-{trace_id}-{span_id}-{flags}"
+  // Lets distributed tracing tools (Jaeger, Grafana Tempo) connect the event
+  // to the full request trace across services.
+  // PRD: "traceparent in envelope" (Section 8.2 Observability)
+  string traceparent = 9;
+
+  // The actual event payload, packed as google.protobuf.Any.
+  // Unpack with: anypb.UnmarshalTo(env.Payload, &myEvent, proto.UnmarshalOptions{})
+  google.protobuf.Any payload = 10;
+}

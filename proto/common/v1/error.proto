@@ -1,0 +1,45 @@
+// common/v1/error.proto — shared structured error details
+//
+// gRPC errors have two parts:
+//   1. A status code  (e.g. NOT_FOUND, INVALID_ARGUMENT) — coarse category
+//   2. Optional details packed into google.rpc.Status.details — fine-grained info
+//
+// Every service packs a DomainError into the details so callers can:
+//   - display a localised message
+//   - take branch logic on the reason (e.g. retry on STOCK_TEMPORARILY_UNAVAILABLE)
+//   - log the offending resource ID without scraping message strings
+//
+// PRD ref: Section 6.1 "shared error model mapping domain errors to gRPC status codes"
+
+syntax = "proto3";
+
+package common.v1;
+
+option go_package = "ecommerce/gen/go/common/v1;commonv1";
+
+// DomainError is packed into google.rpc.Status.details as google.protobuf.Any.
+// Always pair it with the correct gRPC status code:
+//
+//   INVALID_ARGUMENT  → validation failures (bad quantity, missing field)
+//   NOT_FOUND         → resource does not exist (sku_id unknown)
+//   ALREADY_EXISTS    → duplicate create (idempotency key collision)
+//   PERMISSION_DENIED → caller lacks a required role
+//   RESOURCE_EXHAUSTED → rate limit or stock sold out
+//   FAILED_PRECONDITION → state violation (e.g. cart already checked out)
+//   UNAVAILABLE       → downstream dependency down — safe to retry
+message DomainError {
+  // Service that produced the error, e.g. "catalog", "cart", "inventory".
+  string domain = 1;
+
+  // Machine-readable constant in SCREAMING_SNAKE_CASE.
+  // Examples: SKU_NOT_FOUND, QUANTITY_EXCEEDS_LIMIT, INVALID_CURRENCY_CODE
+  // Callers switch on this — never change a value once released.
+  string reason = 2;
+
+  // Human-readable explanation safe to log (no PII).
+  string message = 3;
+
+  // Optional key/value pairs giving extra context.
+  // Examples: {"sku_id": "abc123", "max_quantity": "10"}
+  map<string, string> metadata = 4;
+}
