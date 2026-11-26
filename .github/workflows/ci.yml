@@ -112,7 +112,7 @@ jobs:
       #   - Reports CRITICAL and HIGH CVEs
       # In Phase 6 add image scanning: scan-type: image, image-ref: <ecr-url>
       - name: Scan dependencies and IaC for CVEs
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.20.0
         with:
           scan-type: fs
           scan-ref: .
